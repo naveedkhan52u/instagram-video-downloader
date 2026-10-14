@@ -56,6 +56,38 @@ function firstProviderVideo(payload) {
   return null;
 }
 
+async function resolveWithSelfHosted(postUrl) {
+  const baseUrl = process.env.RESOLVER_URL;
+  const secret = process.env.RESOLVER_SECRET;
+  if (!baseUrl || !secret) return null;
+
+  const endpoint = new URL("/resolve", baseUrl);
+  if (endpoint.protocol !== "https:") {
+    throw new Error("RESOLVER_URL must use HTTPS.");
+  }
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Resolver-Secret": secret,
+      Accept: "application/json"
+    },
+    body: JSON.stringify({ url: postUrl.href }),
+    signal: AbortSignal.timeout(14000)
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload?.detail || "The self-hosted resolver could not process this link.");
+  }
+  if (typeof payload?.downloadUrl !== "string" || !/^https:\/\//i.test(payload.downloadUrl)) {
+    throw new Error("The self-hosted resolver did not return a valid video URL.");
+  }
+  return {
+    downloadUrl: payload.downloadUrl,
+    title: typeof payload.title === "string" ? payload.title.slice(0, 180) : "Instagram video"
+  };
+}
+
 async function resolveWithProvider(postUrl) {
   const key = process.env.SAVEAPI_API_KEY;
   if (!key) return null;
@@ -113,6 +145,15 @@ export default async function handler(req, res) {
   }
 
   try {
+    if (process.env.RESOLVER_URL && process.env.RESOLVER_SECRET) {
+      try {
+        const result = await resolveWithSelfHosted(postUrl);
+        if (result) return res.status(200).json(result);
+      } catch {
+        // Continue to the public-page resolver if the self-hosted worker is temporarily unavailable.
+      }
+    }
+
     if (process.env.SAVEAPI_API_KEY) {
       const result = await resolveWithProvider(postUrl);
       return res.status(200).json(result);
@@ -145,12 +186,12 @@ export default async function handler(req, res) {
     }
 
     if (lastStatus === 429 || lastStatus === 403) {
-      return res.status(502).json({ error: "Instagram is temporarily blocking automated requests. Configure a media API key on the server to resolve public videos more reliably." });
+      return res.status(502).json({ error: "Instagram is temporarily blocking automated requests. A self-hosted resolver may also be blocked; try again later." });
     }
     if (/login\/|accounts\/login|Login • Instagram|Sorry, this page isn't available/i.test(html)) {
       return res.status(422).json({ error: "Instagram returned a login page or unavailable post instead of public video media. Only accessible public posts are supported." });
     }
-    return res.status(422).json({ error: "Instagram did not expose the video in its page HTML. To resolve this link, configure SAVEAPI_API_KEY in the Vercel project environment variables. Only use public media you are authorized to save." });
+    return res.status(422).json({ error: "Instagram did not expose this video's URL. Configure RESOLVER_URL and RESOLVER_SECRET to use the self-hosted resolver, or try another public Reel. Only save media you are authorized to download." });
   } catch (error) {
     return res.status(502).json({ error: error?.message || "The video could not be resolved right now. Please try again later." });
   }
