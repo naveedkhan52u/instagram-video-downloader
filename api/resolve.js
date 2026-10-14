@@ -1,26 +1,30 @@
 const allowedHosts = new Set(["instagram.com", "www.instagram.com", "m.instagram.com"]);
 
 function decodeEscapes(value) {
-  return value.replace(/\\u0026/g, "&").replace(/\\u002F/g, "/").replace(/\\\//g, "/").replace(/&amp;/g, "&").replace(/\\u003D/g, "=");
+  return value
+    .replace(/\\u0026/gi, "&")
+    .replace(/\\u002f/gi, "/")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/g, "&")
+    .replace(/\\u003d/gi, "=")
+    .replace(/\\u0022/gi, '"');
 }
 
 function extractVideoUrl(html) {
   const patterns = [
-    /"video_url":"(https?:\\\/\\\/[^"]+)"/,
-    /"video_url":"(https?:[^"]+)"/,
+    /"video_url"\s*:\s*"([^"]+)"/i,
+    /"playable_url"\s*:\s*"([^"]+)"/i,
     /<meta[^>]+property=["']og:video(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i,
-    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:video(?::secure_url)?["']/i,
-    /"playable_url":"(https?:[^"]+)"/
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:video(?::secure_url)?["']/i
   ];
   for (const pattern of patterns) {
     const match = html.match(pattern);
-    if (match?.[1]) {
-      const candidate = decodeEscapes(match[1]);
-      try {
-        const parsed = new URL(candidate);
-        if (parsed.protocol === "https:" && /cdninstagram\.com$|fbcdn\.net$/.test(parsed.hostname)) return parsed.href;
-      } catch {}
-    }
+    if (!match?.[1]) continue;
+    const candidate = decodeEscapes(match[1]);
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.protocol === "https:" && /(^|\.)cdninstagram\.com$|(^|\.)fbcdn\.net$/i.test(parsed.hostname)) return parsed.href;
+    } catch {}
   }
   return null;
 }
@@ -49,6 +53,7 @@ export default async function handler(req, res) {
       redirect: "follow",
       signal: AbortSignal.timeout(9000)
     });
+    if (!allowedHosts.has(new URL(response.url).hostname.toLowerCase())) return res.status(502).json({ error: "Instagram redirected to an unsupported address." });
     if (!response.ok) return res.status(502).json({ error: "Instagram could not provide this post right now. It may be private, unavailable, or temporarily blocked." });
     const html = await response.text();
     if (html.length > 5_000_000) return res.status(502).json({ error: "The Instagram response was too large to process." });
@@ -57,7 +62,7 @@ export default async function handler(req, res) {
     const titleMatch = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']*)["']/i);
     const title = titleMatch?.[1]?.replace(/&quot;/g, '"').replace(/&amp;/g, "&").slice(0, 180) || "Instagram video";
     return res.status(200).json({ downloadUrl, title });
-  } catch (error) {
+  } catch {
     return res.status(502).json({ error: "Instagram did not respond in time. Please try again later." });
   }
 }
