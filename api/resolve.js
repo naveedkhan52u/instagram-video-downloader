@@ -18,6 +18,7 @@ function extractVideoUrl(html) {
   const patterns = [
     /"video_url"\s*:\s*"([^"]+)"/ig,
     /"playable_url"\s*:\s*"([^"]+)"/ig,
+    /"video_versions"\s*:\s*\[\s*\{\s*"type"\s*:\s*\d+\s*,\s*"url"\s*:\s*"([^"]+)"/ig,
     /"video_versions"\s*:\s*\[\s*\{[^}]*?"url"\s*:\s*"([^"]+)"/ig,
     /<meta[^>]+property=["']og:video(?::secure_url)?["'][^>]+content=["']([^"']+)["']/ig,
     /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:video(?::secure_url)?["']/ig
@@ -32,6 +33,50 @@ function extractVideoUrl(html) {
     }
   }
   return null;
+}
+
+function firstProviderVideo(payload) {
+  const candidates = [
+    ...(Array.isArray(payload?.medias) ? payload.medias : []),
+    ...(Array.isArray(payload?.data?.medias) ? payload.data.medias : []),
+    ...(Array.isArray(payload?.data?.media?.videos) ? payload.data.media.videos : []),
+    ...(Array.isArray(payload?.videos) ? payload.videos : [])
+  ];
+  for (const item of candidates) {
+    const type = String(item?.type || item?.mimeType || item?.ext || "").toLowerCase();
+    const url = item?.url || item?.downloadUrl || item?.download_url;
+    if (typeof url !== "string" || !/^https:\/\//i.test(url)) continue;
+    if (type.includes("video") || type.includes("mp4") || !type) {
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol === "https:") return parsed.href;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+async function resolveWithProvider(postUrl) {
+  const key = process.env.SAVEAPI_API_KEY;
+  if (!key) return null;
+  const endpoint = new URL("https://api.saveapi.org/v1/download");
+  endpoint.searchParams.set("url", postUrl.href);
+  const response = await fetch(endpoint, {
+    method: "GET",
+    headers: { Authorization: "Bearer " + key, Accept: "application/json" },
+    signal: AbortSignal.timeout(12000)
+  });
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("The media API key is missing or invalid. Check SAVEAPI_API_KEY in Vercel environment variables.");
+    }
+    if (response.status === 429) throw new Error("The media API rate limit or credit limit was reached. Check your provider account.");
+    throw new Error("The media API could not resolve this link right now. Please retry shortly.");
+  }
+  const payload = await response.json();
+  const videoUrl = firstProviderVideo(payload);
+  if (payload?.success && videoUrl) return { downloadUrl: videoUrl, title: payload?.meta?.title || payload?.title || "Instagram video" };
+  throw new Error(payload?.message || payload?.error || "The media API did not return a downloadable video for this public link.");
 }
 
 async function fetchInstagramPage(url) {
@@ -64,17 +109,21 @@ export default async function handler(req, res) {
   }
   if (postUrl.protocol !== "https:" || !allowedHosts.has(postUrl.hostname.toLowerCase()) ||
       !/^\/(reel|reels|p|tv)\/[A-Za-z0-9_-]+\/?$/.test(postUrl.pathname)) {
-    return res.status(400).json({ error: "Use a valid public Instagram Reel, video, or post URL." });
+    return res.status(400).json({ error: "Use a valid Instagram Reel, video, or post URL." });
   }
 
-  const canonicalPath = postUrl.pathname.endsWith("/") ? postUrl.pathname : postUrl.pathname + "/";
-  const shortcode = canonicalPath.split("/").filter(Boolean)[1];
-  const candidates = [
-    "https://www.instagram.com" + canonicalPath,
-    "https://www.instagram.com/p/" + shortcode + "/embed/captioned/"
-  ];
-
   try {
+    if (process.env.SAVEAPI_API_KEY) {
+      const result = await resolveWithProvider(postUrl);
+      return res.status(200).json(result);
+    }
+
+    const canonicalPath = postUrl.pathname.endsWith("/") ? postUrl.pathname : postUrl.pathname + "/";
+    const shortcode = canonicalPath.split("/").filter(Boolean)[1];
+    const candidates = [
+      "https://www.instagram.com" + canonicalPath,
+      "https://www.instagram.com/p/" + shortcode + "/embed/captioned/"
+    ];
     let html = "";
     let lastStatus = 0;
     for (const candidateUrl of candidates) {
@@ -96,13 +145,13 @@ export default async function handler(req, res) {
     }
 
     if (lastStatus === 429 || lastStatus === 403) {
-      return res.status(502).json({ error: "Instagram is temporarily blocking automated requests. Please try again later. This is an Instagram-side restriction, not an issue with your link format." });
+      return res.status(502).json({ error: "Instagram is temporarily blocking automated requests. Configure a media API key on the server to resolve public videos more reliably." });
     }
     if (/login\/|accounts\/login|Login • Instagram|Sorry, this page isn't available/i.test(html)) {
-      return res.status(422).json({ error: "Instagram returned a login page or unavailable post instead of public video media. This link cannot be downloaded by the current resolver." });
+      return res.status(422).json({ error: "Instagram returned a login page or unavailable post instead of public video media. Only accessible public posts are supported." });
     }
-    return res.status(422).json({ error: "Instagram did not provide a direct video file for this post. Instagram often hides media from automated requests, so some public links still require a supported media API. This resolver does not access private posts or bypass login controls." });
-  } catch {
-    return res.status(502).json({ error: "Instagram did not respond in time. Please try again later." });
+    return res.status(422).json({ error: "Instagram did not expose the video in its page HTML. To resolve this link, configure SAVEAPI_API_KEY in the Vercel project environment variables. Only use public media you are authorized to save." });
+  } catch (error) {
+    return res.status(502).json({ error: error?.message || "The video could not be resolved right now. Please try again later." });
   }
 }
